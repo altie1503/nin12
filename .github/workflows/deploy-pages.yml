@@ -1,0 +1,75 @@
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+concurrency:
+  group: pages
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Generate games.json
+        run: |
+          list_files() {
+            dir="$1"
+            shift
+            args=()
+            for ext in "$@"; do
+              args+=(-iname "*.$ext" -o)
+            done
+            unset 'args[${#args[@]}-1]'
+            find "$dir" -maxdepth 1 -type f \( "${args[@]}" \) -printf '%f\n' | sort
+          }
+
+          n64_files=$(list_files roms/n64 z64 n64 v64)
+          snes_files=$(list_files roms/snes sfc smc swc fig bs st)
+
+          n64_json=$(printf '%s\n' "$n64_files" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+          snes_json=$(printf '%s\n' "$snes_files" | jq -R -s -c 'split("\n") | map(select(length > 0))')
+
+          jq -n --argjson n64 "$n64_json" --argjson snes "$snes_json" \
+            '{n64: $n64, snes: $snes}' > games.json
+
+          echo "games.json generado:"
+          cat games.json
+
+      - name: Assemble site
+        run: |
+          mkdir -p _site
+          cp index.html games.json _site/
+          cp -r data _site/data
+          cp -r roms _site/roms
+          rm -f _site/roms/README.md
+          find _site/roms -name '.gitkeep' -delete
+
+      - name: Setup Pages
+        uses: actions/configure-pages@v5
+
+      - name: Upload artifact
+        uses: actions/upload-pages-artifact@v3
+        with:
+          path: _site
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Deploy to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v4
