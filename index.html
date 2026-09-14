@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="es">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>ROM Player</title>
+    <style>
+        body,
+        html {
+            margin: 0;
+            padding: 0;
+            width: 100%;
+            height: 100%;
+            background-color: #111;
+            color: #eee;
+            font-family: system-ui, sans-serif;
+        }
+
+        #game {
+            width: 100vw;
+            height: 100vh;
+        }
+
+        /* ---- Menú de selección de juegos ---- */
+        #menu {
+            box-sizing: border-box;
+            width: 100%;
+            min-height: 100vh;
+            padding: 24px;
+        }
+
+        #menu h1 {
+            margin: 0 0 4px;
+        }
+
+        #menu .subtitle {
+            color: #999;
+            margin: 0 0 24px;
+        }
+
+        .system-block {
+            margin-bottom: 32px;
+        }
+
+        .system-block h2 {
+            border-bottom: 1px solid #333;
+            padding-bottom: 8px;
+        }
+
+        .game-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+            gap: 12px;
+        }
+
+        .game-card {
+            background: #1c1c1c;
+            border: 1px solid #333;
+            border-radius: 8px;
+            padding: 16px 12px;
+            text-align: center;
+            cursor: pointer;
+            word-break: break-word;
+        }
+
+        .game-card:hover {
+            border-color: #0066ff;
+            background: #222;
+        }
+
+        .empty {
+            color: #666;
+            font-style: italic;
+        }
+
+        .error {
+            color: #ff5555;
+        }
+
+        /* ---- Barra superior dentro del juego ---- */
+        #back-bar {
+            position: fixed;
+            top: 8px;
+            left: 8px;
+            z-index: 10000;
+        }
+
+        #back-bar button {
+            background: #1c1c1c;
+            color: #eee;
+            border: 1px solid #444;
+            border-radius: 6px;
+            padding: 6px 12px;
+            cursor: pointer;
+        }
+
+        [hidden] {
+            display: none !important;
+        }
+    </style>
+</head>
+
+<body>
+
+    <div id="menu">
+        <h1>ROM Player</h1>
+        <p class="subtitle">Elegí un juego para empezar a jugar.</p>
+        <div id="menu-content">
+            <p>Cargando lista de juegos...</p>
+        </div>
+    </div>
+
+    <div id="back-bar" hidden>
+        <button id="back-btn">&larr; Volver al menú</button>
+    </div>
+
+    <div id="game"></div>
+
+    <script>
+        const SYSTEMS = {
+            n64: { label: 'Nintendo 64', core: 'mupen64plus_next', folder: 'roms/n64/' },
+            snes: { label: 'Super Nintendo', core: 'snes9x', folder: 'roms/snes/' },
+        };
+        const DATA_PATH = 'data/';
+
+        const menuEl = document.getElementById('menu');
+        const menuContentEl = document.getElementById('menu-content');
+        const gameEl = document.getElementById('game');
+        const backBar = document.getElementById('back-bar');
+
+        function displayName(filename) {
+            return filename.replace(/\.[^.]+$/, '');
+        }
+
+        // ---- Lectura del nombre interno grabado dentro de la ROM ----
+        // Así el menú muestra el título real del juego sin importar cómo
+        // se llame el archivo (evita depender de renombrar prolijo a mano).
+
+        async function fetchHeaderBytes(url, length) {
+            const res = await fetch(url, { headers: { Range: `bytes=0-${length - 1}` } });
+            if (!res.ok) throw new Error(`HTTP ${res.status}`);
+            // Si el servidor ignora el Range y devuelve el archivo entero,
+            // no vale la pena parsearlo entero: mejor no usarlo.
+            if (res.status !== 206 && Number(res.headers.get('content-length') || 0) > length * 4) {
+                throw new Error('el servidor no soporta Range requests');
+            }
+            return new Uint8Array(await res.arrayBuffer());
+        }
+
+        function cleanRomName(bytes, offset, len) {
+            let str = '';
+            for (let i = offset; i < offset + len && i < bytes.length; i++) {
+                const b = bytes[i];
+                if (b === 0) break;
+                if (b >= 0x20 && b < 0x7f) str += String.fromCharCode(b);
+            }
+            return str.replace(/\s+/g, ' ').trim();
+        }
+
+        function parseN64Name(bytes) {
+            if (bytes.length < 0x34) return '';
+            const m0 = bytes[0], m1 = bytes[1], m2 = bytes[2], m3 = bytes[3];
+            let normalized;
+            if (m0 === 0x80 && m1 === 0x37 && m2 === 0x12 && m3 === 0x40) {
+                normalized = bytes; // .z64: big-endian nativo
+            } else if (m0 === 0x37 && m1 === 0x80 && m2 === 0x40 && m3 === 0x12) {
+                normalized = new Uint8Array(bytes.length); // .v64: bytes intercambiados de a 2
+                for (let i = 0; i + 1 < bytes.length; i += 2) {
+                    normalized[i] = bytes[i + 1];
+                    normalized[i + 1] = bytes[i];
+                }
+            } else if (m0 === 0x40 && m1 === 0x12 && m2 === 0x37 && m3 === 0x80) {
+                normalized = new Uint8Array(bytes.length); // .n64: little-endian, palabras de 4 bytes
+                for (let i = 0; i + 3 < bytes.length; i += 4) {
+                    normalized[i] = bytes[i + 3];
+                    normalized[i + 1] = bytes[i + 2];
+                    normalized[i + 2] = bytes[i + 1];
+                    normalized[i + 3] = bytes[i];
+                }
+            } else {
+                return '';
+            }
+            return cleanRomName(normalized, 0x20, 20);
+        }
+
+        function snesChecksumOk(bytes, headerOffset) {
+            if (bytes.length < headerOffset + 0x20) return false;
+            const complement = bytes[headerOffset + 0x1c] | (bytes[headerOffset + 0x1d] << 8);
+            const checksum = bytes[headerOffset + 0x1e] | (bytes[headerOffset + 0x1f] << 8);
+            return ((complement + checksum) & 0xffff) === 0xffff;
+        }
+
+        function parseSnesName(bytes) {
+            // LoROM y HiROM, con y sin los 512 bytes de header de copiadora vieja.
+            const candidates = [0x7fc0, 0xffc0, 0x7fc0 + 512, 0xffc0 + 512];
+            for (const off of candidates) {
+                if (snesChecksumOk(bytes, off)) {
+                    const name = cleanRomName(bytes, off, 21);
+                    if (name) return name;
+                }
+            }
+            // Ningún checksum válido: nos quedamos con el candidato más "legible".
+            let best = '';
+            for (const off of candidates) {
+                const name = cleanRomName(bytes, off, 21);
+                if (name.length > best.length) best = name;
+            }
+            return best;
+        }
+
+        async function getRomDisplayName(systemId, filename) {
+            const system = SYSTEMS[systemId];
+            const fallback = displayName(filename);
+            try {
+                const headerLen = systemId === 'snes' ? 0xffc0 + 32 + 512 : 0x40;
+                const bytes = await fetchHeaderBytes(system.folder + filename, headerLen);
+                const name = systemId === 'n64' ? parseN64Name(bytes) : parseSnesName(bytes);
+                return name || fallback;
+            } catch (err) {
+                return fallback;
+            }
+        }
+
+        function renderMenu(index) {
+            menuContentEl.innerHTML = '';
+            let totalGames = 0;
+
+            for (const [systemId, system] of Object.entries(SYSTEMS)) {
+                const files = index[systemId] || [];
+                totalGames += files.length;
+
+                const block = document.createElement('div');
+                block.className = 'system-block';
+
+                const heading = document.createElement('h2');
+                heading.textContent = system.label;
+                block.appendChild(heading);
+
+                if (files.length === 0) {
+                    const p = document.createElement('p');
+                    p.className = 'empty';
+                    p.textContent = `No hay juegos en roms/${systemId}/ todavía.`;
+                    block.appendChild(p);
+                } else {
+                    const grid = document.createElement('div');
+                    grid.className = 'game-grid';
+                    for (const file of files) {
+                        const card = document.createElement('div');
+                        card.className = 'game-card';
+                        card.textContent = displayName(file); // se reemplaza abajo por el nombre real de la ROM
+                        card.dataset.displayName = displayName(file);
+                        card.addEventListener('click', () => launchGame(systemId, file, card.dataset.displayName));
+                        grid.appendChild(card);
+
+                        getRomDisplayName(systemId, file).then(name => {
+                            card.textContent = name;
+                            card.dataset.displayName = name;
+                        });
+                    }
+                    block.appendChild(grid);
+                }
+
+                menuContentEl.appendChild(block);
+            }
+
+            if (totalGames === 0) {
+                const p = document.createElement('p');
+                p.className = 'empty';
+                p.textContent = 'Todavía no subiste ninguna ROM. Mirá roms/README.md para saber cómo agregar juegos.';
+                menuContentEl.appendChild(p);
+            }
+        }
+
+        function launchGame(systemId, filename, gameName) {
+            const system = SYSTEMS[systemId];
+
+            menuEl.hidden = true;
+            backBar.hidden = false;
+
+            window.EJS_player = '#game';
+            window.EJS_core = system.core;
+            window.EJS_gameName = gameName || displayName(filename);
+            window.EJS_color = '#0066ff';
+            window.EJS_startOnLoaded = true;
+            window.EJS_pathtodata = DATA_PATH;
+            window.EJS_gameUrl = system.folder + filename;
+
+            const script = document.createElement('script');
+            script.src = `${DATA_PATH}loader.js`;
+            script.onerror = () => {
+                gameEl.innerHTML = `<p class="error" style="padding:24px">No se pudo cargar ${DATA_PATH}loader.js</p>`;
+            };
+            document.body.appendChild(script);
+        }
+
+        document.getElementById('back-btn').addEventListener('click', () => {
+            window.location.reload();
+        });
+
+        fetch('games.json')
+            .then(res => {
+                if (!res.ok) throw new Error(`HTTP ${res.status}`);
+                return res.json();
+            })
+            .then(renderMenu)
+            .catch(err => {
+                menuContentEl.innerHTML =
+                    `<p class="error">No se pudo cargar games.json (${err.message}). ` +
+                    `¿Corrió el workflow de deploy y Settings &gt; Pages usa "GitHub Actions" como origen?</p>`;
+            });
+    </script>
+</body>
+
+</html>
