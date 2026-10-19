@@ -1,0 +1,7 @@
+# Solo se versiona la herramienta; las ROMs y sus partes no (pesan demasiado).
+*
+!.gitignore
+!Divisor.cs
+!compilar.bat
+!divisor.exe
+!README.md

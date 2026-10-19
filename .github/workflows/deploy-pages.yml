@@ -23,25 +23,39 @@ jobs:
 
       - name: Generate games.json
         run: |
-          list_files() {
-            dir="$1"
-            shift
-            args=()
-            for ext in "$@"; do
-              args+=(-iname "*.$ext" -o)
-            done
-            unset 'args[${#args[@]}-1]'
-            find "$dir" -maxdepth 1 -type f \( "${args[@]}" \) -printf '%f\n' | sort
-          }
+          # Consola -> extensiones aceptadas. Para sumar una consola nueva,
+          # agregala acá y en SYSTEMS dentro de index.html.
+          declare -A SYSTEMS=(
+            [n64]="z64 n64 v64"
+            [snes]="sfc smc swc fig bs st"
+            [nds]="nds"
+          )
 
-          n64_files=$(list_files roms/n64 z64 n64 v64)
-          snes_files=$(list_files roms/snes sfc smc swc fig bs st)
-
-          n64_json=$(printf '%s\n' "$n64_files" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-          snes_json=$(printf '%s\n' "$snes_files" | jq -R -s -c 'split("\n") | map(select(length > 0))')
-
-          jq -n --argjson n64 "$n64_json" --argjson snes "$snes_json" \
-            '{n64: $n64, snes: $snes}' > games.json
+          # Cada juego queda como {"file": "Juego.nds", "parts": N}.
+          # parts > 1 = ROM cortada con divisor.exe en Juego.nds.001, .002, ...
+          echo '{}' > games.json
+          for system in "${!SYSTEMS[@]}"; do
+            dir="roms/$system"
+            files='[]'
+            if [ -d "$dir" ]; then
+              files=$(
+                for ext in ${SYSTEMS[$system]}; do
+                  find "$dir" -maxdepth 1 -type f -iname "*.$ext" -printf '%f\t1\n'
+                  find "$dir" -maxdepth 1 -type f -iname "*.$ext.001" -printf '%f\n' | while IFS= read -r first; do
+                    base="${first%.001}"
+                    parts=1
+                    while [ -f "$dir/$base.$(printf '%03d' $((parts + 1)))" ]; do
+                      parts=$((parts + 1))
+                    done
+                    printf '%s\t%s\n' "$base" "$parts"
+                  done
+                done | sort -f -u \
+                  | jq -R -s -c 'split("\n") | map(select(length > 0) | split("\t") | {file: .[0], parts: (.[1] | tonumber)})'
+              )
+            fi
+            jq --arg s "$system" --argjson f "$files" '. + {($s): $f}' games.json > games.tmp
+            mv games.tmp games.json
+          done
 
           echo "games.json generado:"
           cat games.json
